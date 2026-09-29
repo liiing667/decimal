@@ -618,18 +618,29 @@ func (d Decimal) Div(d2 Decimal) Decimal {
 //	0 <= r < abs(d2) * 10 ^(-precision) if d>=0
 //	0 >= r > -abs(d2) * 10 ^(-precision) if d<0
 //
+// The division is truncated toward zero: q is the multiple of 10^(-precision)
+// nearest to d/d2 whose absolute value does not exceed abs(d/d2). As a
+// consequence, for every combination of signs of d and d2:
+//
+//	d = d2 * q + r holds exactly
+//	sign(r) = sign(d) or r = 0 (the remainder follows the dividend)
+//	abs(r) < abs(d2) * 10^(-precision)
+//
 // Note that precision<0 is allowed as input.
 func (d Decimal) QuoRem(d2 Decimal, precision int32) (Decimal, Decimal) {
 	if d2.getValue().Sign() == 0 {
 		panic("decimal division by 0")
 	}
-	scale := -precision
-	e := int64(d.exp) - int64(d2.exp) - int64(scale)
+	scale := -int64(precision)
+	if scale > math.MaxInt32 || scale < math.MinInt32 {
+		panic("overflow in decimal QuoRem")
+	}
+	e := int64(d.exp) - int64(d2.exp) - scale
 	if e > math.MaxInt32 || e < math.MinInt32 {
 		panic("overflow in decimal QuoRem")
 	}
 	var aa, bb, expo big.Int
-	var scalerest int32
+	var scalerest int64
 	// d = a 10^ea
 	// d2 = b 10^eb
 	if e < 0 {
@@ -637,7 +648,7 @@ func (d Decimal) QuoRem(d2 Decimal, precision int32) (Decimal, Decimal) {
 		expo.SetInt64(-e)
 		bb.Exp(tenInt, &expo, nil)
 		bb.Mul(d2.getValue(), &bb)
-		scalerest = d.exp
+		scalerest = int64(d.exp)
 		// now aa = a
 		//     bb = b 10^(scale + eb - ea)
 	} else {
@@ -645,14 +656,17 @@ func (d Decimal) QuoRem(d2 Decimal, precision int32) (Decimal, Decimal) {
 		aa.Exp(tenInt, &expo, nil)
 		aa.Mul(d.getValue(), &aa)
 		bb = *d2.getValue()
-		scalerest = scale + d2.exp
+		scalerest = scale + int64(d2.exp)
 		// now aa = a ^ (ea - eb - scale)
 		//     bb = b
 	}
+	if scalerest > math.MaxInt32 || scalerest < math.MinInt32 {
+		panic("overflow in decimal QuoRem")
+	}
 	var q, r big.Int
 	q.QuoRem(&aa, &bb, &r)
-	dq := Decimal{value: &q, exp: scale}
-	dr := Decimal{value: &r, exp: scalerest}
+	dq := Decimal{value: &q, exp: int32(scale)}
+	dr := Decimal{value: &r, exp: int32(scalerest)}
 	return dq, dr
 }
 
@@ -687,7 +701,18 @@ func (d Decimal) DivRound(d2 Decimal, precision int32) Decimal {
 	return q.Add(New(1, -precision))
 }
 
-// Mod returns d % d2.
+// Mod returns d % d2, the remainder of the truncating (toward zero) division
+// of d by d2. It is the r returned by d.QuoRem(d2, 0), so for every
+// combination of signs of d and d2:
+//
+//	d = d2 * q + m, where q is the integer quotient truncated toward zero
+//	sign(m) = sign(d) or m = 0 (the result follows the dividend)
+//	abs(m) < abs(d2)
+//
+// In particular the result of Mod with two negative operands is negative or
+// zero, e.g. New(-7, 0).Mod(New(-3, 0)) = -1.
+//
+// Mod panics if d2 is zero.
 func (d Decimal) Mod(d2 Decimal) Decimal {
 	_, r := d.QuoRem(d2, 0)
 	return r

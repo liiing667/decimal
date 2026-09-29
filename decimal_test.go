@@ -1,7 +1,9 @@
 package decimal
 
 import (
+	"bytes"
 	"database/sql/driver"
+	"encoding/gob"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -2257,6 +2259,220 @@ func TestDecimal_Overflow(t *testing.T) {
 	}
 }
 
+// checkQuoRemContract verifies the documented QuoRem contract:
+//
+//	d = d2 * q + r (exactly)
+//	q is an integer multiple of 10^(-precision)
+//	abs(r) < abs(d2) * 10^(-precision)
+//	sign(r) = sign(d) or r = 0 (remainder follows the dividend)
+func checkQuoRemContract(t *testing.T, d, d2 Decimal, precision int32, q, r Decimal) {
+	t.Helper()
+	if !d.Equal(d2.Mul(q).Add(r)) {
+		t.Errorf("identity d2*q + r != d: d=%v, d2=%v, prec=%d, q=%v, r=%v",
+			d, d2, precision, q, r)
+	}
+	if !q.Equal(q.Truncate(precision)) {
+		t.Errorf("quotient wrong precision: d=%v, d2=%v, prec=%d, q=%v, r=%v",
+			d, d2, precision, q, r)
+	}
+	if !r.Abs().LessThan(d2.Abs().Mul(New(1, -precision))) {
+		t.Errorf("remainder too large: d=%v, d2=%v, prec=%d, q=%v, r=%v",
+			d, d2, precision, q, r)
+	}
+	if r.Sign()*d.Sign() < 0 {
+		t.Errorf("remainder does not follow sign of dividend: d=%v, d2=%v, prec=%d, q=%v, r=%v",
+			d, d2, precision, q, r)
+	}
+}
+
+func TestDecimal_QuoRemSignRules(t *testing.T) {
+	type Inp4 struct {
+		d   string
+		d2  string
+		exp int32
+		q   string
+		r   string
+	}
+	cases := []Inp4{
+		// all four sign combinations, truncated toward zero:
+		// the remainder always follows the sign of the dividend
+		{"7", "3", 0, "2", "1"},
+		{"-7", "3", 0, "-2", "-1"},
+		{"7", "-3", 0, "-2", "1"},
+		{"-7", "-3", 0, "2", "-1"},
+		{"7.5", "2", 0, "3", "1.5"},
+		{"-7.5", "2", 0, "-3", "-1.5"},
+		{"7.5", "-2", 0, "-3", "1.5"},
+		{"-7.5", "-2", 0, "3", "-1.5"},
+		// zero dividend and exact divisions give a zero remainder
+		{"0", "5", 0, "0", "0"},
+		{"0", "-5", 2, "0", "0"},
+		{"6", "3", 0, "2", "0"},
+		{"-6", "3", 0, "-2", "0"},
+		{"-6", "-3", 0, "2", "0"},
+		// fractional quotient truncated at the requested precision
+		{"1", "3", 4, "0.3333", "0.0001"},
+		{"-1", "3", 4, "-0.3333", "-0.0001"},
+		{"1", "-3", 4, "-0.3333", "0.0001"},
+		{"-1", "-3", 4, "0.3333", "-0.0001"},
+	}
+
+	for _, inp4 := range cases {
+		d := RequireFromString(inp4.d)
+		d2 := RequireFromString(inp4.d2)
+		q, r := d.QuoRem(d2, inp4.exp)
+		expectedQ := RequireFromString(inp4.q)
+		expectedR := RequireFromString(inp4.r)
+		if !q.Equal(expectedQ) || !r.Equal(expectedR) {
+			t.Errorf("bad QuoRem division %s , %s , %d got %v, %v expected %s , %s",
+				inp4.d, inp4.d2, inp4.exp, q, r, inp4.q, inp4.r)
+		}
+		checkQuoRemContract(t, d, d2, inp4.exp, q, r)
+	}
+}
+
+func TestDecimal_QuoRemHugeValues(t *testing.T) {
+	type Inp4 struct {
+		d   string
+		d2  string
+		exp int32
+		q   string
+		r   string
+	}
+	cases := []Inp4{
+		{"10000000000000000000000000000000000000000", "3", 0,
+			"3333333333333333333333333333333333333333", "1"},
+		{"-10000000000000000000000000000000000000000", "3", 0,
+			"-3333333333333333333333333333333333333333", "-1"},
+		{"10000000000000000000000000000000000000000", "-3", 0,
+			"-3333333333333333333333333333333333333333", "1"},
+		{"12345678901234567890123456789012345678901234567890", "98765432109876543210987654321", 0,
+			"124999998860937500014", "23533950614699073961469907396"},
+		{"-12345678901234567890123456789012345678901234567890", "98765432109876543210987654321", 0,
+			"-124999998860937500014", "-23533950614699073961469907396"},
+		{"99999999999999999999999999999999999999999999999999", "10000000000000000000000000", 0,
+			"9999999999999999999999999", "9999999999999999999999999"},
+		{"1e40", "7", 0, "1428571428571428571428571428571428571428", "4"},
+		{"-1e40", "7", 0, "-1428571428571428571428571428571428571428", "-4"},
+	}
+
+	for _, inp4 := range cases {
+		d := RequireFromString(inp4.d)
+		d2 := RequireFromString(inp4.d2)
+		q, r := d.QuoRem(d2, inp4.exp)
+		expectedQ := RequireFromString(inp4.q)
+		expectedR := RequireFromString(inp4.r)
+		if !q.Equal(expectedQ) || !r.Equal(expectedR) {
+			t.Errorf("bad QuoRem division %s , %s , %d got %v, %v expected %s , %s",
+				inp4.d, inp4.d2, inp4.exp, q, r, inp4.q, inp4.r)
+		}
+		checkQuoRemContract(t, d, d2, inp4.exp, q, r)
+	}
+}
+
+func TestDecimal_QuoRemNegativePrecision(t *testing.T) {
+	type Inp4 struct {
+		d   string
+		d2  string
+		exp int32
+		q   string
+		r   string
+	}
+	cases := []Inp4{
+		// negative precision: quotient is a multiple of 10^(-precision)
+		{"12345", "100", -2, "100", "2345"},
+		{"-12345", "100", -2, "-100", "-2345"},
+		{"12345", "-100", -2, "-100", "2345"},
+		{"-12345", "-100", -2, "100", "-2345"},
+		{"123456", "7", -3, "17000", "4456"},
+		{"-123456", "7", -3, "-17000", "-4456"},
+		{"1000", "10", -3, "0", "1000"},
+		{"999", "3", -2, "300", "99"},
+	}
+
+	for _, inp4 := range cases {
+		d := RequireFromString(inp4.d)
+		d2 := RequireFromString(inp4.d2)
+		q, r := d.QuoRem(d2, inp4.exp)
+		expectedQ := RequireFromString(inp4.q)
+		expectedR := RequireFromString(inp4.r)
+		if !q.Equal(expectedQ) || !r.Equal(expectedR) {
+			t.Errorf("bad QuoRem division %s , %s , %d got %v, %v expected %s , %s",
+				inp4.d, inp4.d2, inp4.exp, q, r, inp4.q, inp4.r)
+		}
+		checkQuoRemContract(t, d, d2, inp4.exp, q, r)
+	}
+}
+
+func TestDecimal_QuoRemExponentOverflow(t *testing.T) {
+	// exponent spreads that do not fit int32 must panic instead of
+	// silently returning a wrong quotient or remainder
+	if !didPanic(func() { New(1, math.MaxInt32).QuoRem(New(1, math.MinInt32), 0) }) {
+		t.Fatalf("should have gotten an overflow panic")
+	}
+	if !didPanic(func() { New(5, math.MinInt32).QuoRem(New(3, math.MinInt32), 100) }) {
+		t.Fatalf("should have gotten an overflow panic")
+	}
+	if !didPanic(func() { New(1, 0).QuoRem(New(1, 0), math.MinInt32) }) {
+		t.Fatalf("should have gotten an overflow panic")
+	}
+}
+
+func TestDecimal_ModSignRules(t *testing.T) {
+	type Inp struct {
+		a string
+		b string
+		m string
+	}
+
+	cases := []Inp{
+		// the result follows the sign of the dividend, abs(m) < abs(b)
+		{"7", "3", "1"},
+		{"-7", "3", "-1"},
+		{"7", "-3", "1"},
+		{"-7", "-3", "-1"},
+		{"7.5", "2", "1.5"},
+		{"-7.5", "2", "-1.5"},
+		{"7.5", "-2", "1.5"},
+		{"-7.5", "-2", "-1.5"},
+		// zero dividend and exact divisions
+		{"0", "5", "0"},
+		{"0", "-5", "0"},
+		{"6", "3", "0"},
+		{"-6", "3", "0"},
+		{"-6", "-3", "0"},
+		// dividend smaller than divisor
+		{"5", "7", "5"},
+		{"-5", "7", "-5"},
+		{"5", "-7", "5"},
+		{"-5", "-7", "-5"},
+	}
+
+	for _, inp := range cases {
+		a := RequireFromString(inp.a)
+		b := RequireFromString(inp.b)
+		m := a.Mod(b)
+		expected := RequireFromString(inp.m)
+		if !m.Equal(expected) {
+			t.Errorf("bad Mod %s %% %s got %v expected %s", inp.a, inp.b, m, inp.m)
+		}
+		if !m.Abs().LessThan(b.Abs()) {
+			t.Errorf("Mod result too large: %s %% %s = %v", inp.a, inp.b, m)
+		}
+		if m.Sign()*a.Sign() < 0 {
+			t.Errorf("Mod result does not follow sign of dividend: %s %% %s = %v", inp.a, inp.b, m)
+		}
+		// Mod must agree with QuoRem: a = b*q + m
+		q, r := a.QuoRem(b, 0)
+		if !r.Equal(m) {
+			t.Errorf("Mod and QuoRem disagree: %s %% %s mod=%v rem=%v", inp.a, inp.b, m, r)
+		}
+		if !a.Equal(b.Mul(q).Add(m)) {
+			t.Errorf("identity b*q + m != a: a=%v, b=%v, q=%v, m=%v", a, b, q, m)
+		}
+	}
+}
+
 func TestDecimal_ExtremeValues(t *testing.T) {
 	// NOTE(vadim): this test takes pretty much forever
 	if testing.Short() {
@@ -3669,6 +3885,66 @@ func TestGobEncode(t *testing.T) {
 		if eq != true {
 			t.Errorf("Error gobencoding/decoding %v, got %v", d1, d3)
 		}
+	}
+}
+
+// A binary round trip must preserve the exact representation of a Decimal:
+// not just the numeric value (Equal), but also the exponent, so that
+// String(), Coefficient() and Exponent() are identical after decoding.
+// This covers zero values with a non-zero exponent (e.g. "0.00") which are
+// common in monetary amounts stored in KV stores.
+func TestDecimal_BinaryRoundTripPreservesRepresentation(t *testing.T) {
+	values := []Decimal{
+		New(0, 0),
+		New(0, -2),
+		New(0, -5),
+		New(0, 3),
+		RequireFromString("0.000"),
+		RequireFromString("-0.00"),
+		{}, // zero value of the type
+		New(12345, -2),
+		RequireFromString("-99999.99999"),
+		RequireFromString("123456789012345678901234567890.12345"),
+	}
+
+	checkSameRepresentation := func(t *testing.T, original, decoded Decimal) {
+		t.Helper()
+		if decoded.String() != original.String() {
+			t.Errorf("String() changed by round trip: was %q, became %q",
+				original.String(), decoded.String())
+		}
+		if decoded.Exponent() != original.Exponent() {
+			t.Errorf("Exponent() changed by round trip: was %d, became %d",
+				original.Exponent(), decoded.Exponent())
+		}
+		if decoded.Coefficient().Cmp(original.Coefficient()) != 0 {
+			t.Errorf("Coefficient() changed by round trip: was %v, became %v",
+				original.Coefficient(), decoded.Coefficient())
+		}
+	}
+
+	for _, d := range values {
+		// through the gob encoder/decoder
+		var buf bytes.Buffer
+		if err := gob.NewEncoder(&buf).Encode(d); err != nil {
+			t.Fatalf("error gob-encoding %v: %v", d, err)
+		}
+		var gobDecoded Decimal
+		if err := gob.NewDecoder(&buf).Decode(&gobDecoded); err != nil {
+			t.Fatalf("error gob-decoding %v: %v", d, err)
+		}
+		checkSameRepresentation(t, d, gobDecoded)
+
+		// through MarshalBinary/UnmarshalBinary directly
+		data, err := d.MarshalBinary()
+		if err != nil {
+			t.Fatalf("error marshalling %v to binary: %v", d, err)
+		}
+		var binDecoded Decimal
+		if err := binDecoded.UnmarshalBinary(data); err != nil {
+			t.Fatalf("error unmarshalling %v from binary: %v", d, err)
+		}
+		checkSameRepresentation(t, d, binDecoded)
 	}
 }
 
